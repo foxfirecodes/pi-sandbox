@@ -1,7 +1,7 @@
 {
-  "name": "pi-sandbox",
+  "name": "@foxfirecodes/pi-sandbox",
   "version": "0.4.3",
-  "description": "OS-level sandboxing for pi with interactive permission prompts",
+  "description": "OS-level sandboxing for pi with interactive permission prompts (fork)",
   "keywords": [
     "pi-package",
     "pi-extension"
@@ -18,14 +18,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/carderne/pi-sandbox.git"
+    "url": "git+https://github.com/foxfirecodes/pi-sandbox.git"
   },
   "author": "Chris Arderne <chris@rdrn.me>",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/carderne/pi-sandbox/issues"
+    "url": "https://github.com/foxfirecodes/pi-sandbox/issues"
   },
-  "homepage": "https://github.com/carderne/pi-sandbox",
+  "homepage": "https://github.com/foxfirecodes/pi-sandbox",
   "scripts": {
     "fmt": "oxfmt index.ts",
     "lint": "oxlint index.ts",
