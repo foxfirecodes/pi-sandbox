@@ -1,6 +1,10 @@
 {
   "enabled": true,
   "allowBrowserProcess": true,
+  "commandPatterns": {
+    "allowPatterns": [],
+    "denyPatterns": []
+  },
   "network": {
     "allowLocalBinding": true,
     "allowAllUnixSockets": true,

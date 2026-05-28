@@ -69,6 +69,15 @@ Note below that the order of precedence for filesystem read and write are opposi
 {
   "enabled": true,
   "allowBrowserProcess": true,     // If you want to use agent-browser or similar Chrome setup
+  "commandPatterns": {
+    // Bash/! commands matching allowPatterns bypass the sandbox entirely.
+    // Bash/! commands matching denyPatterns are hard-blocked.
+    // Non-regex entries are shell-style globs matched against the whole command.
+    // re:/pattern/flags entries are JavaScript regexes.
+    // denyPatterns take precedence over allowPatterns.
+    "allowPatterns": ["gh auth status"],
+    "denyPatterns": []
+  },
   "network": {
     "allowLocalBinding": true,     // ditto
     "allowAllUnixSockets": true,   // ditto
@@ -103,6 +112,10 @@ pi --no-sandbox          disable sandboxing for the session
 
 **Bash commands** are wrapped with `sandbox-exec` (macOS) or `bubblewrap`
 (Linux) to enforce network and filesystem restrictions at the OS level.
+Commands matching `commandPatterns.allowPatterns` bypass this entirely: no OS
+sandbox wrapper, no network pre-check, and no write-block retry prompt.
+Commands matching `commandPatterns.denyPatterns` are hard-blocked before
+execution. Deny patterns take precedence over allow patterns.
 
 **Read, write, and edit tool calls** are intercepted before execution and
 checked against the same filesystem policy. The OS-level sandbox cannot cover
@@ -124,6 +137,8 @@ extension reloads or pi restarts.
 
 | Rule | Behaviour |
 |------|-----------|
+| Command matches `commandPatterns.denyPatterns` | Hard-blocked, no prompt (bash and `!cmd`) |
+| Command matches `commandPatterns.allowPatterns` | Sandbox bypassed entirely (bash and `!cmd`) |
 | Domain not in `allowedDomains` | Prompted (bash and `!cmd`) |
 | Path not in `allowRead` | Prompted (read tool); granting adds to `allowRead` |
 | Path not in `allowWrite` | Prompted (write/edit tools and bash write failures) |
@@ -133,6 +148,15 @@ extension reloads or pi restarts.
 If a path is added to `allowWrite` via a prompt but is also present in
 `denyWrite`, it remains blocked. A warning is shown explaining which config
 files to check.
+
+`commandPatterns.allowPatterns` and `commandPatterns.denyPatterns` support
+shell-style `*` and `?` globs matched against the whole command after trimming
+leading/trailing whitespace. Entries of the form `re:/pattern/flags` are treated
+as JavaScript regexes. A pattern of `"*"` in `allowPatterns` bypasses sandboxing
+for every bash/`!cmd` command; a pattern of `"*"` in `denyPatterns` blocks every
+bash/`!cmd` command. pi-sandbox shows a warning when either is configured. Keep
+allow patterns narrow: if an allow pattern matches a compound shell command such
+as `cmd && other-cmd`, the entire command runs unsandboxed.
 
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it

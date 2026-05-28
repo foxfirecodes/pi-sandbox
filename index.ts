@@ -19,6 +19,8 @@
  *   (d) Allow for all projects       — written to ~/.pi/agent/sandbox.json
  *
  * What gets prompted vs. hard-blocked:
+ *   - commands: hard-blocked if they match commandPatterns.denyPatterns
+ *   - commands: bypassed entirely if they match commandPatterns.allowPatterns
  *   - domains: prompted if not whitelisted nor explicitly denied
  *   - write: prompted if not whitelisted nor explicitly denied
  *   - read: always prompted (because denyRead is used for broad block, may want to punch holes)
@@ -35,6 +37,10 @@
  * ```json
  * {
  *   "enabled": true,
+ *   "commandPatterns": {
+ *     "allowPatterns": ["gh auth status"],
+ *     "denyPatterns": []
+ *   },
  *   "network": {
  *     "allowedDomains": ["github.com", "*.github.com"],
  *     "deniedDomains": []
@@ -86,12 +92,32 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth } from "@earendil-works/pi-tui";
 
+interface CommandPatternsConfig {
+  /**
+   * Command patterns that bypass all bash sandboxing when matched.
+   * Keep these narrow: a matching command runs completely unsandboxed.
+   */
+  allowPatterns?: string[];
+  /** Command patterns that are hard-blocked before execution. */
+  denyPatterns?: string[];
+}
+
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
+  /**
+   * Non-regex entries use shell-style globs matched against the whole command.
+   * Entries of the form re:/pattern/flags are treated as JavaScript regexes.
+   * denyPatterns take precedence over allowPatterns.
+   */
+  commandPatterns?: CommandPatternsConfig;
 }
 
 const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
+  commandPatterns: {
+    allowPatterns: [],
+    denyPatterns: [],
+  },
   network: {
     allowedDomains: [
       "npmjs.org",
@@ -145,6 +171,9 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
   const result: SandboxConfig = { ...base };
 
   if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
+  if (overrides.commandPatterns) {
+    result.commandPatterns = { ...base.commandPatterns, ...overrides.commandPatterns };
+  }
   if (overrides.network) {
     result.network = { ...base.network, ...overrides.network };
   }
@@ -216,6 +245,88 @@ function domainIsAllowed(domain: string, allowedDomains: string[]): boolean {
 
 function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback {
   return async ({ host }) => domainIsAllowed(host, allowedDomains);
+}
+
+// ── Command pattern helpers ───────────────────────────────────────────────────
+
+function normalizeCommandForPattern(command: string): string {
+  return command.trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
+}
+
+function globPatternToRegExp(pattern: string): RegExp {
+  let source = "";
+  for (const char of pattern) {
+    if (char === "*") {
+      source += "[\\s\\S]*";
+    } else if (char === "?") {
+      source += "[\\s\\S]";
+    } else {
+      source += escapeRegExp(char);
+    }
+  }
+  return new RegExp(`^${source}$`);
+}
+
+function regexFromCommandPattern(pattern: string): RegExp | null {
+  const regexPrefix = "re:";
+  if (!pattern.startsWith(regexPrefix)) return null;
+
+  const expression = pattern.slice(regexPrefix.length);
+  if (!expression.startsWith("/")) return null;
+
+  const lastSlash = expression.lastIndexOf("/");
+  if (lastSlash === 0) return null;
+
+  const source = expression.slice(1, lastSlash);
+  const flags = expression.slice(lastSlash + 1);
+  if (!/^[dgimsuvy]*$/.test(flags)) return null;
+
+  try {
+    return new RegExp(source, flags);
+  } catch {
+    return null;
+  }
+}
+
+export function commandMatchesPattern(command: string, pattern: string): boolean {
+  const normalizedCommand = normalizeCommandForPattern(command);
+  const normalizedPattern = pattern.trim();
+  if (!normalizedPattern) return false;
+
+  const regex = regexFromCommandPattern(normalizedPattern);
+  if (regex) return regex.test(normalizedCommand);
+
+  if (normalizedPattern.includes("*") || normalizedPattern.includes("?")) {
+    return globPatternToRegExp(normalizedPattern).test(normalizedCommand);
+  }
+
+  return normalizedCommand === normalizedPattern;
+}
+
+function commandMatchesAnyPattern(command: string, patterns: string[] | undefined): boolean {
+  return (
+    patterns?.some(
+      (pattern) => typeof pattern === "string" && commandMatchesPattern(command, pattern),
+    ) ?? false
+  );
+}
+
+function getStringPatternList(patterns: unknown): string[] {
+  return Array.isArray(patterns)
+    ? patterns.filter((pattern): pattern is string => typeof pattern === "string")
+    : [];
+}
+
+function getCommandAllowPatterns(config: SandboxConfig): string[] {
+  return getStringPatternList(config.commandPatterns?.allowPatterns);
+}
+
+function getCommandDenyPatterns(config: SandboxConfig): string[] {
+  return getStringPatternList(config.commandPatterns?.denyPatterns);
 }
 
 // ── Output analysis ───────────────────────────────────────────────────────────
@@ -451,6 +562,13 @@ export default function (pi: ExtensionAPI) {
     return [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths];
   }
 
+  function getCommandPatternDecision(command: string, cwd: string): "deny" | "allow" | "sandbox" {
+    const config = loadConfig(cwd);
+    if (commandMatchesAnyPattern(command, getCommandDenyPatterns(config))) return "deny";
+    if (commandMatchesAnyPattern(command, getCommandAllowPatterns(config))) return "allow";
+    return "sandbox";
+  }
+
   // ── Sandbox reinitialize ────────────────────────────────────────────────────
   // Called after granting a session/permanent allowance so the OS-level sandbox
   // picks up the new rules before the next bash subprocess starts.
@@ -668,6 +786,34 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  function warnIfBroadCommandPatterns(ctx: ExtensionContext, config: SandboxConfig): void {
+    if (getCommandAllowPatterns(config).includes("*")) {
+      ctx.ui.notify(
+        '⚠️ Bash sandbox is bypassed for all commands because commandPatterns.allowPatterns contains "*". ' +
+          'Only use this intentionally; remove "*" to restore sandboxed command execution.',
+        "warning",
+      );
+    }
+
+    if (getCommandDenyPatterns(config).includes("*")) {
+      ctx.ui.notify(
+        '⚠️ All bash commands are blocked because commandPatterns.denyPatterns contains "*".',
+        "warning",
+      );
+    }
+  }
+
+  function formatCommandPatternStatusSuffix(config: SandboxConfig): string {
+    const allowCount = getCommandAllowPatterns(config).length;
+    const denyCount = getCommandDenyPatterns(config).length;
+    const labels: string[] = [];
+
+    if (allowCount > 0) labels.push(`${allowCount} allow pattern${allowCount === 1 ? "" : "s"}`);
+    if (denyCount > 0) labels.push(`${denyCount} deny pattern${denyCount === 1 ? "" : "s"}`);
+
+    return labels.length > 0 ? `, ${labels.join(", ")}` : "";
+  }
+
   // ── Apply allowance choices ─────────────────────────────────────────────────
 
   async function applyDomainChoice(
@@ -712,8 +858,27 @@ export default function (pi: ExtensionAPI) {
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
+      const command = (params as { command?: unknown }).command;
+      const commandDecision =
+        sandboxEnabled && typeof command === "string"
+          ? getCommandPatternDecision(command, ctx?.cwd ?? localCwd)
+          : "sandbox";
+      const sandboxBypassed = commandDecision === "allow";
+
+      if (commandDecision === "deny") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Blocked: command matches commandPatterns.denyPatterns. Use /sandbox to review your config.",
+            },
+          ],
+          details: {},
+        };
+      }
+
       const runBash = () => {
-        if (!sandboxEnabled || !sandboxInitialized) {
+        if (sandboxBypassed || !sandboxEnabled || !sandboxInitialized) {
           return localBash.execute(id, params, signal, onUpdate, ctx);
         }
         const sandboxedBash = createBashToolDefinition(localCwd, {
@@ -742,7 +907,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Post-execution: detect OS-level write block and offer to allow.
-      if (sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
+      if (!sandboxBypassed && sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
         const outputText = result.content
           .filter((c: any) => c.type === "text")
           .map((c: any) => c.text)
@@ -789,6 +954,20 @@ export default function (pi: ExtensionAPI) {
   pi.on("user_bash", async (event, ctx) => {
     if (!sandboxEnabled || !sandboxInitialized) return;
 
+    const commandDecision = getCommandPatternDecision(event.command, ctx.cwd);
+    if (commandDecision === "deny") {
+      return {
+        result: {
+          output:
+            "Blocked: command matches commandPatterns.denyPatterns. Use /sandbox to review your config.",
+          exitCode: 1,
+          cancelled: false,
+          truncated: false,
+        },
+      };
+    }
+    if (commandDecision === "allow") return;
+
     const domains = extractDomainsFromCommand(event.command);
     const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
 
@@ -824,6 +1003,17 @@ export default function (pi: ExtensionAPI) {
 
     // Network pre-check for bash tool calls.
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
+      const commandDecision = getCommandPatternDecision(event.input.command, ctx.cwd);
+      if (commandDecision === "deny") {
+        return {
+          block: true,
+          reason:
+            `Command matches commandPatterns.denyPatterns. ` +
+            `To change this, edit commandPatterns.denyPatterns in:\n  ${projectPath}\n  ${globalPath}`,
+        };
+      }
+      if (commandDecision === "allow") return;
+
       const domains = extractDomainsFromCommand(event.input.command);
       const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
       for (const domain of domains) {
@@ -955,14 +1145,19 @@ export default function (pi: ExtensionAPI) {
       sandboxInitialized = true;
 
       warnIfAllDomainsAllowed(ctx, config);
+      warnIfBroadCommandPatterns(ctx, config);
 
       const networkLabel = allowsAllDomains(config.network?.allowedDomains)
         ? "all domains"
         : `${config.network?.allowedDomains?.length ?? 0} domains`;
       const writeCount = config.filesystem?.allowWrite?.length ?? 0;
+      const commandPatternLabel = formatCommandPatternStatusSuffix(config);
       ctx.ui.setStatus(
         "sandbox",
-        ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
+        ctx.ui.theme.fg(
+          "accent",
+          `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths${commandPatternLabel}`,
+        ),
       );
     } catch (err) {
       sandboxEnabled = false;
@@ -1025,14 +1220,19 @@ export default function (pi: ExtensionAPI) {
         sandboxInitialized = true;
 
         warnIfAllDomainsAllowed(ctx, config);
+        warnIfBroadCommandPatterns(ctx, config);
 
         const networkLabel = allowsAllDomains(config.network?.allowedDomains)
           ? "all domains"
           : `${config.network?.allowedDomains?.length ?? 0} domains`;
         const writeCount = config.filesystem?.allowWrite?.length ?? 0;
+        const commandPatternLabel = formatCommandPatternStatusSuffix(config);
         ctx.ui.setStatus(
           "sandbox",
-          ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
+          ctx.ui.theme.fg(
+            "accent",
+            `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths${commandPatternLabel}`,
+          ),
         );
         ctx.ui.notify("Sandbox enabled", "info");
       } catch (err) {
@@ -1077,11 +1277,23 @@ export default function (pi: ExtensionAPI) {
 
       const config = loadConfig(ctx.cwd);
       const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+      const commandAllowPatterns = getCommandAllowPatterns(config);
+      const commandDenyPatterns = getCommandDenyPatterns(config);
 
       const lines = [
         "Sandbox Configuration",
         `  Project config: ${projectPath}`,
         `  Global config:  ${globalPath}`,
+        "",
+        "Command patterns (bash + !cmd):",
+        `  Allow patterns: ${commandAllowPatterns.join(", ") || "(none)"}`,
+        ...(commandAllowPatterns.includes("*")
+          ? ['  ⚠️ allowPatterns "*" bypasses the sandbox for every command.']
+          : []),
+        `  Deny patterns:  ${commandDenyPatterns.join(", ") || "(none)"}`,
+        ...(commandDenyPatterns.includes("*")
+          ? ['  ⚠️ denyPatterns "*" blocks every command.']
+          : []),
         "",
         "Network (bash + !cmd):",
         `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
@@ -1105,6 +1317,9 @@ export default function (pi: ExtensionAPI) {
           ? [`  Session write: ${sessionAllowedWritePaths.join(", ")}`]
           : []),
         "",
+        "Note: commandPatterns.denyPatterns hard-blocks matching bash commands.",
+        "Note: commandPatterns.allowPatterns bypasses all bash sandboxing for matching commands.",
+        "Note: commandPatterns.denyPatterns takes precedence over allowPatterns.",
         "Note: ALL reads are prompted unless the path is already in allowRead.",
         "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
         "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
