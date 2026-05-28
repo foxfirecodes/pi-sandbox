@@ -1,6 +1,6 @@
 {
   "name": "@foxfirecodes/pi-sandbox",
-  "version": "0.4.3",
+  "version": "0.1.0",
   "description": "OS-level sandboxing for pi with interactive permission prompts (fork)",
   "keywords": [
     "pi-package",
