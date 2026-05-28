@@ -102,6 +102,11 @@ interface CommandPatternsConfig {
   denyPatterns?: string[];
 }
 
+type CommandPatternDecision =
+  | { action: "deny"; listName: "denyPatterns"; pattern: string }
+  | { action: "allow"; listName: "allowPatterns"; pattern: string }
+  | { action: "sandbox" };
+
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
   /**
@@ -307,11 +312,12 @@ export function commandMatchesPattern(command: string, pattern: string): boolean
   return normalizedCommand === normalizedPattern;
 }
 
-function commandMatchesAnyPattern(command: string, patterns: string[] | undefined): boolean {
-  return (
-    patterns?.some(
-      (pattern) => typeof pattern === "string" && commandMatchesPattern(command, pattern),
-    ) ?? false
+function findMatchingCommandPattern(
+  command: string,
+  patterns: string[] | undefined,
+): string | undefined {
+  return patterns?.find(
+    (pattern) => typeof pattern === "string" && commandMatchesPattern(command, pattern),
   );
 }
 
@@ -327,6 +333,24 @@ function getCommandAllowPatterns(config: SandboxConfig): string[] {
 
 function getCommandDenyPatterns(config: SandboxConfig): string[] {
   return getStringPatternList(config.commandPatterns?.denyPatterns);
+}
+
+function formatCommandPatternNotice(decision: CommandPatternDecision): string | undefined {
+  if (decision.action === "sandbox") return undefined;
+
+  const pattern = JSON.stringify(decision.pattern);
+  if (decision.action === "deny") {
+    return `[Sandbox] Command denied by commandPatterns.${decision.listName} (${pattern}); blocked before execution.`;
+  }
+
+  return `[Sandbox] Command approved by commandPatterns.${decision.listName} (${pattern}); running without sandbox.`;
+}
+
+function prependNoticeToResult<T>(result: AgentToolResult<T>, notice: string): AgentToolResult<T> {
+  return {
+    ...result,
+    content: [{ type: "text", text: notice }, ...result.content],
+  };
 }
 
 // ── Output analysis ───────────────────────────────────────────────────────────
@@ -562,11 +586,19 @@ export default function (pi: ExtensionAPI) {
     return [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths];
   }
 
-  function getCommandPatternDecision(command: string, cwd: string): "deny" | "allow" | "sandbox" {
+  function getCommandPatternDecision(command: string, cwd: string): CommandPatternDecision {
     const config = loadConfig(cwd);
-    if (commandMatchesAnyPattern(command, getCommandDenyPatterns(config))) return "deny";
-    if (commandMatchesAnyPattern(command, getCommandAllowPatterns(config))) return "allow";
-    return "sandbox";
+    const deniedPattern = findMatchingCommandPattern(command, getCommandDenyPatterns(config));
+    if (deniedPattern) {
+      return { action: "deny", listName: "denyPatterns", pattern: deniedPattern };
+    }
+
+    const allowedPattern = findMatchingCommandPattern(command, getCommandAllowPatterns(config));
+    if (allowedPattern) {
+      return { action: "allow", listName: "allowPatterns", pattern: allowedPattern };
+    }
+
+    return { action: "sandbox" };
   }
 
   // ── Sandbox reinitialize ────────────────────────────────────────────────────
@@ -859,41 +891,55 @@ export default function (pi: ExtensionAPI) {
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
       const command = (params as { command?: unknown }).command;
-      const commandDecision =
+      const commandDecision: CommandPatternDecision =
         sandboxEnabled && typeof command === "string"
           ? getCommandPatternDecision(command, ctx?.cwd ?? localCwd)
-          : "sandbox";
-      const sandboxBypassed = commandDecision === "allow";
+          : { action: "sandbox" };
+      const commandPatternNotice = formatCommandPatternNotice(commandDecision);
+      const sandboxBypassed = commandDecision.action === "allow";
+      const updateWithNotice =
+        commandPatternNotice && onUpdate
+          ? (partial: AgentToolResult<any>) =>
+              onUpdate(prependNoticeToResult(partial, commandPatternNotice))
+          : onUpdate;
 
-      if (commandDecision === "deny") {
-        return {
+      if (commandDecision.action === "deny") {
+        const result = {
           content: [
             {
-              type: "text",
-              text: "Blocked: command matches commandPatterns.denyPatterns. Use /sandbox to review your config.",
+              type: "text" as const,
+              text:
+                commandPatternNotice ??
+                "[Sandbox] Command denied by commandPatterns.denyPatterns; blocked before execution.",
             },
           ],
           details: {},
         };
+        onUpdate?.(result);
+        return result;
       }
 
       const runBash = () => {
         if (sandboxBypassed || !sandboxEnabled || !sandboxInitialized) {
-          return localBash.execute(id, params, signal, onUpdate, ctx);
+          return localBash.execute(id, params, signal, updateWithNotice, ctx);
         }
         const sandboxedBash = createBashToolDefinition(localCwd, {
           operations: createSandboxedBashOps(userShellPath),
           shellPath: userShellPath,
         });
-        return sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+        return sandboxedBash.execute(id, params, signal, updateWithNotice, ctx);
       };
 
       let result: AgentToolResult<any>;
       try {
         result = await runBash();
+        if (commandPatternNotice) result = prependNoticeToResult(result, commandPatternNotice);
       } catch (e) {
         if (!(e instanceof Error)) throw e;
-        if (!e.message.includes("Operation not permitted")) throw e;
+        if (!e.message.includes("Operation not permitted")) {
+          if (commandPatternNotice) throw new Error(`${commandPatternNotice}\n\n${e.message}`);
+          throw e;
+        }
 
         result = {
           content: [
@@ -955,18 +1001,20 @@ export default function (pi: ExtensionAPI) {
     if (!sandboxEnabled || !sandboxInitialized) return;
 
     const commandDecision = getCommandPatternDecision(event.command, ctx.cwd);
-    if (commandDecision === "deny") {
+    const commandPatternNotice = formatCommandPatternNotice(commandDecision);
+    if (commandDecision.action === "deny") {
       return {
         result: {
           output:
-            "Blocked: command matches commandPatterns.denyPatterns. Use /sandbox to review your config.",
+            commandPatternNotice ??
+            "[Sandbox] Command denied by commandPatterns.denyPatterns; blocked before execution.",
           exitCode: 1,
           cancelled: false,
           truncated: false,
         },
       };
     }
-    if (commandDecision === "allow") return;
+    if (commandDecision.action === "allow") return;
 
     const domains = extractDomainsFromCommand(event.command);
     const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
@@ -1004,15 +1052,15 @@ export default function (pi: ExtensionAPI) {
     // Network pre-check for bash tool calls.
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
       const commandDecision = getCommandPatternDecision(event.input.command, ctx.cwd);
-      if (commandDecision === "deny") {
+      if (commandDecision.action === "deny") {
         return {
           block: true,
           reason:
-            `Command matches commandPatterns.denyPatterns. ` +
+            `${formatCommandPatternNotice(commandDecision)}\n` +
             `To change this, edit commandPatterns.denyPatterns in:\n  ${projectPath}\n  ${globalPath}`,
         };
       }
-      if (commandDecision === "allow") return;
+      if (commandDecision.action === "allow") return;
 
       const domains = extractDomainsFromCommand(event.input.command);
       const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
