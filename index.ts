@@ -366,13 +366,13 @@ function extractBlockedWritePath(output: string): string | null {
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
 
-function expandPath(filePath: string): string {
+function expandPath(filePath: string, baseCwd = process.cwd()): string {
   const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
-  return resolve(expanded);
+  return resolve(baseCwd, expanded);
 }
 
-function canonicalizePath(filePath: string): string {
-  const abs = expandPath(filePath);
+function canonicalizePath(filePath: string, baseCwd = process.cwd()): string {
+  const abs = expandPath(filePath, baseCwd);
   try {
     return realpathSync.native(abs);
   } catch {
@@ -394,10 +394,10 @@ function canonicalizePath(filePath: string): string {
   }
 }
 
-function matchesPattern(filePath: string, patterns: string[]): boolean {
-  const abs = canonicalizePath(filePath);
+function matchesPattern(filePath: string, patterns: string[], baseCwd = process.cwd()): boolean {
+  const abs = canonicalizePath(filePath, baseCwd);
   return patterns.some((p) => {
-    const absP = p.includes("*") ? expandPath(p) : canonicalizePath(p);
+    const absP = p.includes("*") ? expandPath(p, baseCwd) : canonicalizePath(p, baseCwd);
     if (p.includes("*")) {
       const escaped = absP.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
       return new RegExp(`^${escaped}$`).test(abs);
@@ -405,6 +405,79 @@ function matchesPattern(filePath: string, patterns: string[]): boolean {
     const sep = absP.endsWith("/") ? "" : "/";
     return abs === absP || abs.startsWith(absP + sep);
   });
+}
+
+function splitShellWords(command: string): string[] {
+  const words: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+
+  const pushCurrent = () => {
+    if (current.length > 0) {
+      words.push(current);
+      current = "";
+    }
+  };
+
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else if (quote === '"' && char === "\\" && i + 1 < command.length) {
+        current += command[++i];
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      pushCurrent();
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (char === "\\" && i + 1 < command.length) {
+      current += command[++i];
+    } else if ("|&;<>()".includes(char)) {
+      pushCurrent();
+    } else {
+      current += char;
+    }
+  }
+
+  pushCurrent();
+  return words;
+}
+
+function looksLikePathToken(value: string): boolean {
+  return (
+    value === "~" ||
+    value.startsWith("~/") ||
+    value.startsWith("/") ||
+    value.startsWith("./") ||
+    value.startsWith("../")
+  );
+}
+
+function extractPathCandidatesFromCommand(command: string, cwd: string): string[] {
+  const candidates = new Set<string>();
+
+  for (const word of splitShellWords(command)) {
+    const values = [word];
+    const equalsIndex = word.indexOf("=");
+    if (equalsIndex > 0 && equalsIndex < word.length - 1) {
+      values.push(word.slice(equalsIndex + 1));
+    }
+
+    for (const value of values) {
+      if (looksLikePathToken(value)) {
+        candidates.add(canonicalizePath(value, cwd));
+      }
+    }
+  }
+
+  return [...candidates];
 }
 
 // ── Config file updaters (Node.js process — not OS-sandboxed) ─────────────────
@@ -632,6 +705,18 @@ export default function (pi: ExtensionAPI) {
   function getEffectiveAllowWrite(cwd: string): string[] {
     const config = loadConfig(cwd);
     return [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths];
+  }
+
+  function getBlockedReadPathsForCommand(command: string, cwd: string): string[] {
+    const config = loadConfig(cwd);
+    const denyRead = config.filesystem?.denyRead ?? [];
+    if (denyRead.length === 0) return [];
+
+    const effectiveAllowRead = getEffectiveAllowRead(cwd);
+    return extractPathCandidatesFromCommand(command, cwd).filter(
+      (path) =>
+        matchesPattern(path, denyRead, cwd) && !matchesPattern(path, effectiveAllowRead, cwd),
+    );
   }
 
   function getCommandPatternDecision(command: string, cwd: string): CommandPatternDecision {
@@ -943,12 +1028,14 @@ export default function (pi: ExtensionAPI) {
   async function promptReadBlock(
     ctx: ExtensionContext,
     filePath: string,
+    command?: string,
   ): Promise<PermissionPromptResult> {
     return showPermissionPrompt(
       ctx,
       `📖 Read blocked: "${filePath}" is not in allowRead`,
       "Allowed read path",
       filePath,
+      command,
     );
   }
 
@@ -1144,12 +1231,12 @@ export default function (pi: ExtensionAPI) {
                 content: [
                   {
                     type: "text",
-                    text: `\n--- Command allowPattern added for "${choice.value}", retrying ---\n`,
+                    text: `\n--- Command allowPattern added for "${choice.value}", retrying without sandbox ---\n`,
                   },
                 ],
                 details: {},
               });
-              return runBash();
+              return localBash.execute(id, params, signal, updateWithNotice, ctx);
             }
 
             await applyWriteChoice(choice.action, choice.value, ctx.cwd);
@@ -1205,6 +1292,25 @@ export default function (pi: ExtensionAPI) {
     }
     if (commandDecision.action === "allow") return;
 
+    for (const blockedPath of getBlockedReadPathsForCommand(event.command, ctx.cwd)) {
+      const choice = await promptReadBlock(ctx, blockedPath, event.command);
+      if (choice.action === "abort") {
+        return {
+          result: {
+            output: `Blocked: read access to "${blockedPath}" is not in allowRead. Use /sandbox to review your config.`,
+            exitCode: 1,
+            cancelled: false,
+            truncated: false,
+          },
+        };
+      }
+      if (choice.target === "command") {
+        await applyCommandAllowPatternChoice(choice.action, choice.value, ctx.cwd);
+        return;
+      }
+      await applyReadChoice(choice.action, choice.value, ctx.cwd);
+    }
+
     const domains = extractDomainsFromCommand(event.command);
     const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
 
@@ -1254,6 +1360,21 @@ export default function (pi: ExtensionAPI) {
         };
       }
       if (commandDecision.action === "allow") return;
+
+      for (const blockedPath of getBlockedReadPathsForCommand(event.input.command, ctx.cwd)) {
+        const choice = await promptReadBlock(ctx, blockedPath, event.input.command);
+        if (choice.action === "abort") {
+          return {
+            block: true,
+            reason: `Read access to "${blockedPath}" is blocked (not in allowRead).`,
+          };
+        }
+        if (choice.target === "command") {
+          await applyCommandAllowPatternChoice(choice.action, choice.value, ctx.cwd);
+          return;
+        }
+        await applyReadChoice(choice.action, choice.value, ctx.cwd);
+      }
 
       const domains = extractDomainsFromCommand(event.input.command);
       const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
