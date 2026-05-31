@@ -39,7 +39,8 @@
     "@changesets/cli": "^2.31.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0"
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.78.0"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
@@ -47,11 +48,12 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@earendil-works/pi-tui": "^0.78.0",
     "@types/node": "^24",
-    "oxfmt": "^0.47.0",
+    "oxfmt": "^0.52.0",
     "oxlint": "^1.62.0",
-    "typescript": "^5"
+    "typescript": "^6.0.3"
   },
   "overrides": {
     "minimatch": ">=10.2.1",
