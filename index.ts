@@ -485,6 +485,16 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
 
       const { shell, args } = getShellConfig(shellPath);
       const wrappedCommand = await SandboxManager.wrapWithSandbox(command, shell);
+      let cleanedUp = false;
+      const cleanupSandboxMounts = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        try {
+          SandboxManager.cleanupAfterCommand();
+        } catch (e) {
+          console.error(`Warning: Failed to clean up sandbox mount points: ${e}`);
+        }
+      };
 
       return new Promise((resolve, reject) => {
         const child = spawn(shell, [...args, wrappedCommand], {
@@ -515,6 +525,7 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
 
         child.on("error", (err) => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
+          cleanupSandboxMounts();
           reject(err);
         });
 
@@ -533,6 +544,7 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
         child.on("close", (code) => {
           if (timeoutHandle) clearTimeout(timeoutHandle);
           signal?.removeEventListener("abort", onAbort);
+          cleanupSandboxMounts();
 
           if (signal?.aborted) {
             reject(new Error("aborted"));
