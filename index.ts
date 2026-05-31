@@ -475,6 +475,19 @@ function addWritePathToConfig(configPath: string, pathToAdd: string): void {
   }
 }
 
+function addCommandAllowPatternToConfig(configPath: string, pattern: string): void {
+  const config = readOrEmptyConfig(configPath);
+  const existing = config.commandPatterns?.allowPatterns ?? [];
+  if (!existing.includes(pattern)) {
+    config.commandPatterns = {
+      ...config.commandPatterns,
+      allowPatterns: [...existing, pattern],
+      denyPatterns: config.commandPatterns?.denyPatterns ?? [],
+    };
+    writeConfigFile(configPath, config);
+  }
+}
+
 // ── Sandboxed bash ops ────────────────────────────────────────────────────────
 
 export function protectBangsForSandboxWrap(command: string): {
@@ -602,6 +615,7 @@ export default function (pi: ExtensionAPI) {
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
+  const sessionAllowedCommandAllowPatterns: string[] = [];
 
   // ── Effective config helpers ────────────────────────────────────────────────
 
@@ -625,6 +639,14 @@ export default function (pi: ExtensionAPI) {
     const deniedPattern = findMatchingCommandPattern(command, getCommandDenyPatterns(config));
     if (deniedPattern) {
       return { action: "deny", listName: "denyPatterns", pattern: deniedPattern };
+    }
+
+    const sessionAllowedPattern = findMatchingCommandPattern(
+      command,
+      sessionAllowedCommandAllowPatterns,
+    );
+    if (sessionAllowedPattern) {
+      return { action: "allow", listName: "allowPatterns", pattern: sessionAllowedPattern };
     }
 
     const allowedPattern = findMatchingCommandPattern(command, getCommandAllowPatterns(config));
@@ -672,174 +694,275 @@ export default function (pi: ExtensionAPI) {
 
   // ── UI prompts ──────────────────────────────────────────────────────────────
 
+  type PermissionAction = "abort" | "session" | "project" | "global";
+  type PermissionTarget = "resource" | "command";
+
   interface PromptOption {
     label: string;
-    key: string;
-    action: "abort" | "session" | "project" | "global";
+    action: PermissionAction;
     confirm?: boolean;
     hint?: string;
   }
 
-  const PERMISSION_OPTIONS: PromptOption[] = [
-    { label: "Allow for this session only", key: "s", action: "session" },
-    { label: "Abort (keep blocked)", key: "esc", action: "abort" },
+  interface PermissionPromptResult {
+    action: PermissionAction;
+    target: PermissionTarget;
+    value: string;
+  }
+
+  const RESOURCE_PERMISSION_OPTIONS: PromptOption[] = [
+    { label: "Allow for this session only", action: "session" },
+    { label: "Abort (keep blocked)", action: "abort" },
     {
       label: "Allow for this project",
-      key: "P",
       action: "project",
       confirm: true,
       hint: "→ .pi/sandbox.json",
     },
     {
       label: "Allow for all projects",
-      key: "A",
       action: "global",
       confirm: true,
       hint: "→ ~/.pi/agent/sandbox.json",
     },
   ];
 
+  const COMMAND_PERMISSION_OPTIONS: PromptOption[] = [
+    { label: "Allow this command pattern for this session only", action: "session" },
+    { label: "Abort (keep blocked)", action: "abort" },
+    {
+      label: "Add command allowPattern for this project",
+      action: "project",
+      confirm: true,
+      hint: "→ .pi/sandbox.json commandPatterns.allowPatterns",
+    },
+    {
+      label: "Add command allowPattern for all projects",
+      action: "global",
+      confirm: true,
+      hint: "→ ~/.pi/agent/sandbox.json commandPatterns.allowPatterns",
+    },
+  ];
+
+  function isPrintableInput(data: string): boolean {
+    if (data.length === 0) return false;
+    for (let i = 0; i < data.length; i++) {
+      const code = data.charCodeAt(i);
+      if (code < 32 || code === 127) return false;
+    }
+    return true;
+  }
+
   async function showPermissionPrompt(
     ctx: ExtensionContext,
     title: string,
-    options: PromptOption[],
-  ): Promise<"abort" | "session" | "project" | "global"> {
-    if (!ctx.hasUI) return "abort";
+    resourceLabel: string,
+    initialResourceValue: string,
+    command?: string,
+  ): Promise<PermissionPromptResult> {
+    if (!ctx.hasUI) {
+      return { action: "abort", target: "resource", value: initialResourceValue };
+    }
 
-    const result = await ctx.ui.custom<"abort" | "session" | "project" | "global">(
-      (tui, theme, _kb, done) => {
-        let selectedIndex = 0;
-        let pendingAction: "abort" | "session" | "project" | "global" | null = null;
+    const result = await ctx.ui.custom<PermissionPromptResult>((tui, theme, _kb, done) => {
+      let selectedIndex = 0;
+      let pendingAction: PermissionAction | null = null;
+      let target: PermissionTarget = "resource";
+      let resourceValue = initialResourceValue;
+      let commandValue = command ?? "";
 
-        function resolve(action: "abort" | "session" | "project" | "global") {
-          done(action);
+      function currentValue(): string {
+        return target === "command" ? commandValue : resourceValue;
+      }
+
+      function setCurrentValue(value: string): void {
+        if (target === "command") {
+          commandValue = value;
+        } else {
+          resourceValue = value;
         }
+      }
 
-        return {
-          render(width: number): string[] {
-            const lines: string[] = [];
-            lines.push(truncateToWidth(theme.fg("warning", title), width));
-            lines.push("");
+      function currentOptions(): PromptOption[] {
+        return target === "command" ? COMMAND_PERMISSION_OPTIONS : RESOURCE_PERMISSION_OPTIONS;
+      }
 
-            for (let i = 0; i < options.length; i++) {
-              const opt = options[i];
-              const isSelected = i === selectedIndex;
-              const isPending = pendingAction === opt.action;
+      function resolve(action: PermissionAction) {
+        done({ action, target, value: currentValue().trim() });
+      }
 
-              const prefix = isSelected ? " → " : "   ";
-              const keyHint = theme.fg("accent", `[${opt.key}]`);
-              let label = opt.label;
+      function switchTarget(): void {
+        if (!command) return;
+        target = target === "command" ? "resource" : "command";
+        selectedIndex = 0;
+        pendingAction = null;
+        tui.requestRender();
+      }
 
-              if (opt.hint) {
-                label += `  ${theme.fg("dim", opt.hint)}`;
-              }
+      return {
+        render(width: number): string[] {
+          const lines: string[] = [];
+          const options = currentOptions();
+          const targetLabel = target === "command" ? "Command allowPattern" : resourceLabel;
 
-              if (isPending) {
-                label += `  ${theme.fg("warning", "→ press Enter to confirm")}`;
-              }
+          lines.push(truncateToWidth(theme.fg("warning", title), width));
+          lines.push("");
+          lines.push(truncateToWidth(`${theme.fg("accent", targetLabel)}:`, width));
+          lines.push(truncateToWidth(`  ${currentValue() || theme.fg("dim", "(empty)")}`, width));
+          if (command) {
+            lines.push(
+              truncateToWidth(
+                theme.fg(
+                  "dim",
+                  target === "command"
+                    ? "Editing command allowPattern. Press Tab to edit the blocked value instead."
+                    : "Editing blocked value. Press Tab to allow the whole command by pattern instead.",
+                ),
+                width,
+              ),
+            );
+          }
+          lines.push("");
 
-              const line = `${prefix}${keyHint} ${label}`;
-              lines.push(truncateToWidth(line, width));
+          for (let i = 0; i < options.length; i++) {
+            const opt = options[i];
+            const isSelected = i === selectedIndex;
+            const isPending = pendingAction === opt.action;
+
+            const prefix = isSelected ? " → " : "   ";
+            let label = opt.label;
+
+            if (opt.hint) {
+              label += `  ${theme.fg("dim", opt.hint)}`;
             }
 
-            lines.push("");
-            const footer = pendingAction
-              ? "↑↓ navigate  enter confirm  esc cancel"
-              : "↑↓ navigate  enter select  esc/ctrl+c cancel";
-            lines.push(truncateToWidth(theme.fg("dim", footer), width));
-
-            return lines;
-          },
-
-          handleInput(data: string): void {
-            if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-              resolve("abort");
-              return;
+            if (isPending) {
+              label += `  ${theme.fg("warning", "→ press Enter to confirm")}`;
             }
 
-            if (matchesKey(data, Key.enter)) {
-              if (pendingAction) {
-                resolve(pendingAction);
-              } else {
-                resolve(options[selectedIndex]?.action ?? "abort");
-              }
-              return;
-            }
+            lines.push(truncateToWidth(`${prefix}${label}`, width));
+          }
 
-            if (matchesKey(data, Key.up)) {
-              selectedIndex = Math.max(0, selectedIndex - 1);
+          lines.push("");
+          const footer = pendingAction
+            ? "enter confirm  esc cancel"
+            : "type edit  backspace delete  ↑↓ choose action  enter select  tab switch  esc cancel";
+          lines.push(truncateToWidth(theme.fg("dim", footer), width));
+
+          return lines;
+        },
+
+        handleInput(data: string): void {
+          if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+            resolve("abort");
+            return;
+          }
+
+          if (matchesKey(data, Key.tab)) {
+            switchTarget();
+            return;
+          }
+
+          if (matchesKey(data, Key.enter)) {
+            const options = currentOptions();
+            const option = options[selectedIndex];
+            const action = option?.action ?? "abort";
+            if (action !== "abort" && !currentValue().trim()) {
               pendingAction = null;
               tui.requestRender();
               return;
             }
-            if (matchesKey(data, Key.down)) {
-              selectedIndex = Math.min(options.length - 1, selectedIndex + 1);
-              pendingAction = null;
+            if (pendingAction) {
+              resolve(pendingAction);
+            } else if (option?.confirm) {
+              pendingAction = action;
               tui.requestRender();
-              return;
+            } else {
+              resolve(action);
             }
+            return;
+          }
 
-            for (let i = 0; i < options.length; i++) {
-              const opt = options[i];
-              if (data === opt.key) {
-                // Exact case match (uppercase P/A) → immediate
-                resolve(opt.action);
-                return;
-              }
-              if (data.toLowerCase() === opt.key.toLowerCase()) {
-                // Lowercase match → confirmation required for P/A
-                if (opt.confirm) {
-                  pendingAction = opt.action;
-                  selectedIndex = i;
-                } else {
-                  resolve(opt.action);
-                }
-                tui.requestRender();
-                return;
-              }
-            }
-          },
+          if (matchesKey(data, Key.up)) {
+            selectedIndex = Math.max(0, selectedIndex - 1);
+            pendingAction = null;
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, Key.down)) {
+            selectedIndex = Math.min(currentOptions().length - 1, selectedIndex + 1);
+            pendingAction = null;
+            tui.requestRender();
+            return;
+          }
 
-          invalidate(): void {
-            // no-op
-          },
-        };
-      },
-    );
+          if (matchesKey(data, Key.backspace) || matchesKey(data, Key.delete)) {
+            setCurrentValue(currentValue().slice(0, -1));
+            pendingAction = null;
+            tui.requestRender();
+            return;
+          }
 
-    return result ?? "abort";
+          if (matchesKey(data, Key.ctrl("u"))) {
+            setCurrentValue("");
+            pendingAction = null;
+            tui.requestRender();
+            return;
+          }
+
+          if (isPrintableInput(data)) {
+            setCurrentValue(currentValue() + data);
+            pendingAction = null;
+            tui.requestRender();
+          }
+        },
+
+        invalidate(): void {
+          // no-op
+        },
+      };
+    });
+
+    return result ?? { action: "abort", target: "resource", value: initialResourceValue };
   }
 
   async function promptDomainBlock(
     ctx: ExtensionContext,
     domain: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
+    command?: string,
+  ): Promise<PermissionPromptResult> {
     return showPermissionPrompt(
       ctx,
       `🌐 Network blocked: "${domain}" is not in allowedDomains`,
-      PERMISSION_OPTIONS,
+      "Allowed domain",
+      domain,
+      command,
     );
   }
 
   async function promptReadBlock(
     ctx: ExtensionContext,
     filePath: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
+  ): Promise<PermissionPromptResult> {
     return showPermissionPrompt(
       ctx,
       `📖 Read blocked: "${filePath}" is not in allowRead`,
-      PERMISSION_OPTIONS,
+      "Allowed read path",
+      filePath,
     );
   }
 
   async function promptWriteBlock(
     ctx: ExtensionContext,
     filePath: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
+    command?: string,
+  ): Promise<PermissionPromptResult> {
     return showPermissionPrompt(
       ctx,
       `📝 Write blocked: "${filePath}" is not in allowWrite`,
-      PERMISSION_OPTIONS,
+      "Allowed write path",
+      filePath,
+      command,
     );
   }
 
@@ -883,7 +1006,7 @@ export default function (pi: ExtensionAPI) {
   // ── Apply allowance choices ─────────────────────────────────────────────────
 
   async function applyDomainChoice(
-    choice: "session" | "project" | "global",
+    choice: Exclude<PermissionAction, "abort">,
     domain: string,
     cwd: string,
   ): Promise<void> {
@@ -895,7 +1018,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function applyReadChoice(
-    choice: "session" | "project" | "global",
+    choice: Exclude<PermissionAction, "abort">,
     filePath: string,
     cwd: string,
   ): Promise<void> {
@@ -907,7 +1030,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function applyWriteChoice(
-    choice: "session" | "project" | "global",
+    choice: Exclude<PermissionAction, "abort">,
     filePath: string,
     cwd: string,
   ): Promise<void> {
@@ -915,6 +1038,20 @@ export default function (pi: ExtensionAPI) {
     if (!sessionAllowedWritePaths.includes(filePath)) sessionAllowedWritePaths.push(filePath);
     if (choice === "project") addWritePathToConfig(projectPath, filePath);
     if (choice === "global") addWritePathToConfig(globalPath, filePath);
+    await reinitializeSandbox(cwd);
+  }
+
+  async function applyCommandAllowPatternChoice(
+    choice: Exclude<PermissionAction, "abort">,
+    pattern: string,
+    cwd: string,
+  ): Promise<void> {
+    const { globalPath, projectPath } = getConfigPaths(cwd);
+    if (!sessionAllowedCommandAllowPatterns.includes(pattern)) {
+      sessionAllowedCommandAllowPatterns.push(pattern);
+    }
+    if (choice === "project") addCommandAllowPatternToConfig(projectPath, pattern);
+    if (choice === "global") addCommandAllowPatternToConfig(globalPath, pattern);
     await reinitializeSandbox(cwd);
   }
 
@@ -995,16 +1132,34 @@ export default function (pi: ExtensionAPI) {
 
         const blockedPath = extractBlockedWritePath(outputText);
         if (blockedPath) {
-          const choice = await promptWriteBlock(ctx, blockedPath);
-          if (choice !== "abort") {
-            await applyWriteChoice(choice, blockedPath, ctx.cwd);
+          const choice = await promptWriteBlock(
+            ctx,
+            blockedPath,
+            typeof command === "string" ? command : undefined,
+          );
+          if (choice.action !== "abort") {
+            if (choice.target === "command") {
+              await applyCommandAllowPatternChoice(choice.action, choice.value, ctx.cwd);
+              onUpdate?.({
+                content: [
+                  {
+                    type: "text",
+                    text: `\n--- Command allowPattern added for "${choice.value}", retrying ---\n`,
+                  },
+                ],
+                details: {},
+              });
+              return runBash();
+            }
+
+            await applyWriteChoice(choice.action, choice.value, ctx.cwd);
 
             // Check if denyWrite would still block it even after allowing.
             const config = loadConfig(ctx.cwd);
             const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
-            if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [])) {
+            if (matchesPattern(choice.value, config.filesystem?.denyWrite ?? [])) {
               ctx.ui.notify(
-                `⚠️ "${blockedPath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
+                `⚠️ "${choice.value}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
                   `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
                 "warning",
               );
@@ -1015,7 +1170,7 @@ export default function (pi: ExtensionAPI) {
               content: [
                 {
                   type: "text",
-                  text: `\n--- Write access granted for "${blockedPath}", retrying ---\n`,
+                  text: `\n--- Write access granted for "${choice.value}", retrying ---\n`,
                 },
               ],
               details: {},
@@ -1055,8 +1210,8 @@ export default function (pi: ExtensionAPI) {
 
     for (const domain of domains) {
       if (!domainIsAllowed(domain, effectiveDomains)) {
-        const choice = await promptDomainBlock(ctx, domain);
-        if (choice === "abort") {
+        const choice = await promptDomainBlock(ctx, domain, event.command);
+        if (choice.action === "abort") {
           return {
             result: {
               output: `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.`,
@@ -1066,7 +1221,11 @@ export default function (pi: ExtensionAPI) {
             },
           };
         }
-        await applyDomainChoice(choice, domain, ctx.cwd);
+        if (choice.target === "command") {
+          await applyCommandAllowPatternChoice(choice.action, choice.value, ctx.cwd);
+          return;
+        }
+        await applyDomainChoice(choice.action, choice.value, ctx.cwd);
       }
     }
 
@@ -1100,14 +1259,18 @@ export default function (pi: ExtensionAPI) {
       const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
       for (const domain of domains) {
         if (!domainIsAllowed(domain, effectiveDomains)) {
-          const choice = await promptDomainBlock(ctx, domain);
-          if (choice === "abort") {
+          const choice = await promptDomainBlock(ctx, domain, event.input.command);
+          if (choice.action === "abort") {
             return {
               block: true,
               reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
             };
           }
-          await applyDomainChoice(choice, domain, ctx.cwd);
+          if (choice.target === "command") {
+            await applyCommandAllowPatternChoice(choice.action, choice.value, ctx.cwd);
+            return;
+          }
+          await applyDomainChoice(choice.action, choice.value, ctx.cwd);
         }
       }
     }
@@ -1124,13 +1287,13 @@ export default function (pi: ExtensionAPI) {
 
       if (!matchesPattern(filePath, effectiveAllowRead)) {
         const choice = await promptReadBlock(ctx, filePath);
-        if (choice === "abort") {
+        if (choice.action === "abort") {
           return {
             block: true,
             reason: `Sandbox: read access denied for "${filePath}"`,
           };
         }
-        await applyReadChoice(choice, filePath, ctx.cwd);
+        await applyReadChoice(choice.action, choice.value, ctx.cwd);
         // Allowed — fall through, tool runs.
         return;
       }
@@ -1154,13 +1317,13 @@ export default function (pi: ExtensionAPI) {
 
       if (shouldPromptForWrite(path, allowWrite, matchesPattern)) {
         const choice = await promptWriteBlock(ctx, path);
-        if (choice === "abort") {
+        if (choice.action === "abort") {
           return {
             block: true,
             reason: `Sandbox: write access denied for "${path}" (not in allowWrite)`,
           };
         }
-        await applyWriteChoice(choice, path, ctx.cwd);
+        await applyWriteChoice(choice.action, choice.value, ctx.cwd);
         // Allowed — fall through, tool runs.
         return;
       }
@@ -1371,6 +1534,9 @@ export default function (pi: ExtensionAPI) {
         `  Allow patterns: ${commandAllowPatterns.join(", ") || "(none)"}`,
         ...(commandAllowPatterns.includes("*")
           ? ['  ⚠️ allowPatterns "*" bypasses the sandbox for every command.']
+          : []),
+        ...(sessionAllowedCommandAllowPatterns.length > 0
+          ? [`  Session allow patterns: ${sessionAllowedCommandAllowPatterns.join(", ")}`]
           : []),
         `  Deny patterns:  ${commandDenyPatterns.join(", ") || "(none)"}`,
         ...(commandDenyPatterns.includes("*")
