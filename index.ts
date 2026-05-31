@@ -484,7 +484,10 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
       }
 
       const { shell, args } = getShellConfig(shellPath);
-      const wrappedCommand = await SandboxManager.wrapWithSandbox(command, shell);
+      const SENTINEL = "__PI_SANDBOX_ESCAPED_BANG__";
+      const protectedCommand = command.replace(/\\!/g, SENTINEL);
+      let wrappedCommand = await SandboxManager.wrapWithSandbox(protectedCommand, shell);
+      wrappedCommand = wrappedCommand.replace(/\\!/g, "!").replaceAll(SENTINEL, "\\!");
       let cleanedUp = false;
       const cleanupSandboxMounts = () => {
         if (cleanedUp) return;
