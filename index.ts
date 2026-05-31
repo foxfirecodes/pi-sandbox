@@ -73,6 +73,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -476,6 +477,25 @@ function addWritePathToConfig(configPath: string, pathToAdd: string): void {
 
 // ── Sandboxed bash ops ────────────────────────────────────────────────────────
 
+export function protectBangsForSandboxWrap(command: string): {
+  protectedCommand: string;
+  sentinel: string;
+} {
+  let sentinel = `__PI_SANDBOX_BANG_${randomUUID().replaceAll("-", "")}__`;
+  while (command.includes(sentinel)) {
+    sentinel = `__PI_SANDBOX_BANG_${randomUUID().replaceAll("-", "")}__`;
+  }
+
+  return {
+    protectedCommand: command.replaceAll("!", sentinel),
+    sentinel,
+  };
+}
+
+export function restoreBangsAfterSandboxWrap(wrappedCommand: string, sentinel: string): string {
+  return wrappedCommand.replaceAll(sentinel, "!");
+}
+
 function createSandboxedBashOps(shellPath?: string): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
@@ -484,10 +504,9 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
       }
 
       const { shell, args } = getShellConfig(shellPath);
-      const SENTINEL = "__PI_SANDBOX_ESCAPED_BANG__";
-      const protectedCommand = command.replace(/\\!/g, SENTINEL);
+      const { protectedCommand, sentinel } = protectBangsForSandboxWrap(command);
       let wrappedCommand = await SandboxManager.wrapWithSandbox(protectedCommand, shell);
-      wrappedCommand = wrappedCommand.replace(/\\!/g, "!").replaceAll(SENTINEL, "\\!");
+      wrappedCommand = restoreBangsAfterSandboxWrap(wrappedCommand, sentinel);
       let cleanedUp = false;
       const cleanupSandboxMounts = () => {
         if (cleanedUp) return;
