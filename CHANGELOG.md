@@ -1,5 +1,11 @@
 # @foxfirecodes/pi-sandbox
 
+## 0.3.0
+
+### Minor Changes
+
+- 4508ef3: use new sandbox runtime and new bind behavior to allow nested writes in read dirs
+
 ## 0.2.0
 
 ### Minor Changes
