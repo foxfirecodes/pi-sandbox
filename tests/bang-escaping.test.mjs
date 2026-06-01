@@ -1,9 +1,12 @@
-import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { homedir } from "node:os";
 import test from "node:test";
 
 import { SandboxManager } from "@carderne/sandbox-runtime";
+import assert from "node:assert/strict";
+
 import {
+  collapseHomePath,
   protectBangsForSandboxWrap,
   restoreBangsAfterSandboxWrap,
 } from "../index.ts";
@@ -39,6 +42,14 @@ function canRunBwrap() {
   const result = spawnSync("bwrap", ["--version"], { stdio: "ignore" });
   return result.status === 0;
 }
+
+test("home paths are collapsed to tilde for prompt defaults", () => {
+  const home = homedir();
+  assert.equal(collapseHomePath(home), "~");
+  assert.equal(collapseHomePath(`${home}/.pi/sandbox.json`), "~/.pi/sandbox.json");
+  assert.equal(collapseHomePath(`${home}-backup/file`), `${home}-backup/file`);
+  assert.equal(collapseHomePath("/tmp/file"), "/tmp/file");
+});
 
 test("bang protection replaces only bang bytes and leaves preceding backslashes for shell-quote", () => {
   const command = String.raw`node -e 'console.log(3 !== 2, "\\!, \\\\!")'`;

@@ -178,7 +178,10 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
 
   if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
   if (overrides.commandPatterns) {
-    result.commandPatterns = { ...base.commandPatterns, ...overrides.commandPatterns };
+    result.commandPatterns = {
+      ...base.commandPatterns,
+      ...overrides.commandPatterns,
+    };
   }
   if (overrides.network) {
     result.network = { ...base.network, ...overrides.network };
@@ -365,6 +368,14 @@ function extractBlockedWritePath(output: string): string | null {
 }
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
+
+export function collapseHomePath(filePath: string): string {
+  const home = homedir();
+  if (!home || home === "/") return filePath;
+  if (filePath === home) return "~";
+  if (filePath.startsWith(home + "/")) return "~" + filePath.slice(home.length);
+  return filePath;
+}
 
 function expandPath(filePath: string, baseCwd = process.cwd()): string {
   const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
@@ -678,7 +689,9 @@ export default function (pi: ExtensionAPI) {
 
   const localCwd = process.cwd();
   const userShellPath = SettingsManager.create(localCwd).getShellPath();
-  const localBash = createBashToolDefinition(localCwd, { shellPath: userShellPath });
+  const localBash = createBashToolDefinition(localCwd, {
+    shellPath: userShellPath,
+  });
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
@@ -723,7 +736,11 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig(cwd);
     const deniedPattern = findMatchingCommandPattern(command, getCommandDenyPatterns(config));
     if (deniedPattern) {
-      return { action: "deny", listName: "denyPatterns", pattern: deniedPattern };
+      return {
+        action: "deny",
+        listName: "denyPatterns",
+        pattern: deniedPattern,
+      };
     }
 
     const sessionAllowedPattern = findMatchingCommandPattern(
@@ -731,12 +748,20 @@ export default function (pi: ExtensionAPI) {
       sessionAllowedCommandAllowPatterns,
     );
     if (sessionAllowedPattern) {
-      return { action: "allow", listName: "allowPatterns", pattern: sessionAllowedPattern };
+      return {
+        action: "allow",
+        listName: "allowPatterns",
+        pattern: sessionAllowedPattern,
+      };
     }
 
     const allowedPattern = findMatchingCommandPattern(command, getCommandAllowPatterns(config));
     if (allowedPattern) {
-      return { action: "allow", listName: "allowPatterns", pattern: allowedPattern };
+      return {
+        action: "allow",
+        listName: "allowPatterns",
+        pattern: allowedPattern,
+      };
     }
 
     return { action: "sandbox" };
@@ -813,7 +838,10 @@ export default function (pi: ExtensionAPI) {
   ];
 
   const COMMAND_PERMISSION_OPTIONS: PromptOption[] = [
-    { label: "Allow this command pattern for this session only", action: "session" },
+    {
+      label: "Allow this command pattern for this session only",
+      action: "session",
+    },
     { label: "Abort (keep blocked)", action: "abort" },
     {
       label: "Add command allowPattern for this project",
@@ -846,7 +874,11 @@ export default function (pi: ExtensionAPI) {
     command?: string,
   ): Promise<PermissionPromptResult> {
     if (!ctx.hasUI) {
-      return { action: "abort", target: "resource", value: initialResourceValue };
+      return {
+        action: "abort",
+        target: "resource",
+        value: initialResourceValue,
+      };
     }
 
     const result = await ctx.ui.custom<PermissionPromptResult>((tui, theme, _kb, done) => {
@@ -1008,7 +1040,13 @@ export default function (pi: ExtensionAPI) {
       };
     });
 
-    return result ?? { action: "abort", target: "resource", value: initialResourceValue };
+    return (
+      result ?? {
+        action: "abort",
+        target: "resource",
+        value: initialResourceValue,
+      }
+    );
   }
 
   async function promptDomainBlock(
@@ -1030,11 +1068,12 @@ export default function (pi: ExtensionAPI) {
     filePath: string,
     command?: string,
   ): Promise<PermissionPromptResult> {
+    const displayPath = collapseHomePath(filePath);
     return showPermissionPrompt(
       ctx,
-      `📖 Read blocked: "${filePath}" is not in allowRead`,
+      `📖 Read blocked: "${displayPath}" is not in allowRead`,
       "Allowed read path",
-      filePath,
+      displayPath,
       command,
     );
   }
@@ -1044,11 +1083,12 @@ export default function (pi: ExtensionAPI) {
     filePath: string,
     command?: string,
   ): Promise<PermissionPromptResult> {
+    const displayPath = collapseHomePath(filePath);
     return showPermissionPrompt(
       ctx,
-      `📝 Write blocked: "${filePath}" is not in allowWrite`,
+      `📝 Write blocked: "${displayPath}" is not in allowWrite`,
       "Allowed write path",
-      filePath,
+      displayPath,
       command,
     );
   }
