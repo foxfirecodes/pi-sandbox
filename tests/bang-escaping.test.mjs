@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import test from "node:test";
 
-import { SandboxManager } from "@carderne/sandbox-runtime";
+import { SandboxManager } from "@foxfirecodes/sandbox-runtime";
 import assert from "node:assert/strict";
 
 import {

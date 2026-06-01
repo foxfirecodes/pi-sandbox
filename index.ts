@@ -5,7 +5,7 @@
  * Sandbox Extension - OS-level sandboxing for bash commands, plus path policy
  * enforcement for pi's read/write/edit tools, with interactive permission prompts.
  *
- * Uses @carderne/sandbox-runtime to enforce filesystem and network
+ * Uses @foxfirecodes/sandbox-runtime to enforce filesystem and network
  * restrictions on bash commands at the OS level (sandbox-exec on macOS,
  * bubblewrap on Linux). Also intercepts the read, write, and edit tools to
  * apply the same denyRead/denyWrite/allowWrite filesystem rules, which OS-level
@@ -82,7 +82,7 @@ import {
   SandboxManager,
   type SandboxAskCallback,
   type SandboxRuntimeConfig,
-} from "@carderne/sandbox-runtime";
+} from "@foxfirecodes/sandbox-runtime";
 import {
   type BashOperations,
   createBashToolDefinition,

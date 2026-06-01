@@ -38,6 +38,7 @@
       "/tmp",
       "~/.pi/",
       "~/.cache/uv",
+      "~/.cache/mise",
       "~/.rustup",
       "~/.agent-browser",
       "~/Library/Application Support/Google/Chrome",

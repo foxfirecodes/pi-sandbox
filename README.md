@@ -7,7 +7,7 @@ Sandbox for [pi](https://pi.dev/).
 Sandboxes pi like this:
 
 - read/write/edit: direct control using allow/deny lists
-- bash: uses [`@carderne/sandbox-runtime`](https://www.npmjs.com/package/@carderne/sandbox-runtime) to control network and file system access
+- bash: uses [`@foxfirecodes/sandbox-runtime`](https://www.npmjs.com/package/@foxfirecodes/sandbox-runtime) to control network and file system access
 
 When a blocked action is attempted, the user is
 prompted to allow it temporarily or permanently rather than silently failing.
@@ -27,9 +27,8 @@ You may need to trial and error to find additional things you need to allow.
 #### Prerequisites
 
 `pi-sandbox` delegates the OS-level bash sandbox to
-[`@carderne/sandbox-runtime`](https://www.npmjs.com/package/@carderne/sandbox-runtime),
-published from the fork at <https://github.com/carderne/sandbox-runtime>,
-which is forked from Anthropic's
+[`@foxfirecodes/sandbox-runtime`](https://www.npmjs.com/package/@foxfirecodes/sandbox-runtime),
+published from a fork of Anthropic's
 [`anthropic-experimental/sandbox-runtime`](https://github.com/anthropic-experimental/sandbox-runtime).
 The sandbox runtime checks for [`ripgrep`](https://github.com/BurntSushi/ripgrep) (the
 `rg` binary) on **both macOS and Linux** at sandbox-init time. If `rg`
@@ -168,6 +167,13 @@ as `cmd && other-cmd`, the entire command runs unsandboxed.
 allow all domains; pi-sandbox shows a warning when this is configured because it
 removes per-domain prompts and can be easy to add accidentally. `allowWrite` uses prefix
 matching, so `.` covers the entire current working directory.
+
+On Linux, broad read allowances can coexist with more-specific nested write
+allowances under the same directory. For example, `allowRead: ["~/.cache"]` with
+`allowWrite: ["~/.cache/uv", "~/.cache/mise"]` exposes the cache tree read-only
+while restoring the selected subtrees writable afterward. `denyWrite` and the
+runtime's mandatory sensitive-path write denies are still applied last, so they
+continue to override both broad reads and nested writes.
 
 > **⚠️ Read and write have different precedence rules:**
 >
