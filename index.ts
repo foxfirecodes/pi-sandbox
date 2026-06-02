@@ -79,11 +79,6 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import {
-  SandboxManager,
-  type SandboxAskCallback,
-  type SandboxRuntimeConfig,
-} from "@foxfirecodes/sandbox-runtime";
-import {
   type BashOperations,
   createBashToolDefinition,
   getAgentDir,
@@ -92,6 +87,11 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  SandboxManager,
+  type SandboxAskCallback,
+  type SandboxRuntimeConfig,
+} from "@foxfirecodes/sandbox-runtime";
 
 interface CommandPatternsConfig {
   /**
@@ -316,6 +316,81 @@ export function commandMatchesPattern(command: string, pattern: string): boolean
   return normalizedCommand === normalizedPattern;
 }
 
+export interface CommandSegmentsForPatternMatching {
+  segments: string[];
+  hasSeparator: boolean;
+  hasEmptySegment: boolean;
+}
+
+// This is intentionally only a lightweight shell-ish splitter, not a full parser.
+// It prevents a single allowPattern match from bypassing the sandbox for a
+// top-level command chain such as `git commit && other-command`.
+export function splitCommandForPatternMatching(command: string): CommandSegmentsForPatternMatching {
+  const segments: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let hasSeparator = false;
+
+  const pushSegment = () => {
+    segments.push(current.trim());
+    current = "";
+  };
+
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+
+    if (quote) {
+      current += char;
+      if (char === quote) {
+        quote = null;
+      } else if (quote === '"' && char === "\\" && i + 1 < command.length) {
+        current += command[++i];
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+
+    if (char === "\\" && i + 1 < command.length) {
+      current += char + command[++i];
+      continue;
+    }
+
+    const next = command[i + 1];
+    if (char === "&" && next === "&") {
+      pushSegment();
+      hasSeparator = true;
+      i++;
+      continue;
+    }
+    if (char === "|" && next === "|") {
+      pushSegment();
+      hasSeparator = true;
+      i++;
+      continue;
+    }
+    if (char === ";" || char === "\n" || char === "|" || char === "&") {
+      pushSegment();
+      hasSeparator = true;
+      continue;
+    }
+
+    current += char;
+  }
+
+  pushSegment();
+
+  return {
+    segments,
+    hasSeparator,
+    hasEmptySegment: segments.some((segment) => segment.length === 0),
+  };
+}
+
 function findMatchingCommandPattern(
   command: string,
   patterns: string[] | undefined,
@@ -323,6 +398,35 @@ function findMatchingCommandPattern(
   return patterns?.find(
     (pattern) => typeof pattern === "string" && commandMatchesPattern(command, pattern),
   );
+}
+
+export function findMatchingDenyCommandPattern(
+  command: string,
+  patterns: string[] | undefined,
+): string | undefined {
+  const fullCommandMatch = findMatchingCommandPattern(command, patterns);
+  if (fullCommandMatch) return fullCommandMatch;
+
+  const { segments, hasSeparator } = splitCommandForPatternMatching(command);
+  if (!hasSeparator) return undefined;
+
+  return segments
+    .filter((segment) => segment.length > 0)
+    .map((segment) => findMatchingCommandPattern(segment, patterns))
+    .find((pattern): pattern is string => Boolean(pattern));
+}
+
+export function findMatchingAllowCommandPattern(
+  command: string,
+  patterns: string[] | undefined,
+): string | undefined {
+  const { segments, hasSeparator, hasEmptySegment } = splitCommandForPatternMatching(command);
+  if (segments.length === 0 || hasEmptySegment) return undefined;
+
+  if (!hasSeparator) return findMatchingCommandPattern(command, patterns);
+
+  const matches = segments.map((segment) => findMatchingCommandPattern(segment, patterns));
+  return matches.every((pattern) => Boolean(pattern)) ? matches[0] : undefined;
 }
 
 function getStringPatternList(patterns: unknown): string[] {
@@ -734,7 +838,7 @@ export default function (pi: ExtensionAPI) {
 
   function getCommandPatternDecision(command: string, cwd: string): CommandPatternDecision {
     const config = loadConfig(cwd);
-    const deniedPattern = findMatchingCommandPattern(command, getCommandDenyPatterns(config));
+    const deniedPattern = findMatchingDenyCommandPattern(command, getCommandDenyPatterns(config));
     if (deniedPattern) {
       return {
         action: "deny",
@@ -743,7 +847,7 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
-    const sessionAllowedPattern = findMatchingCommandPattern(
+    const sessionAllowedPattern = findMatchingAllowCommandPattern(
       command,
       sessionAllowedCommandAllowPatterns,
     );
@@ -755,7 +859,10 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
-    const allowedPattern = findMatchingCommandPattern(command, getCommandAllowPatterns(config));
+    const allowedPattern = findMatchingAllowCommandPattern(
+      command,
+      getCommandAllowPatterns(config),
+    );
     if (allowedPattern) {
       return {
         action: "allow",
